@@ -1,9 +1,10 @@
-// Native TLS 1.2/1.3 client streams (`tls`) backed by OpenSSL 3.
-// `TlsStream` wraps an opaque `Int64` slot handle so it is `Send` and safe to
-// pass across `std.task.spawn`, `std.sync.Chan`, and `std.actor.Actor`.
+// Native TLS 1.2/1.3 client streams (`net.tls`) backed by OpenSSL 3.
+// `TlsStream` wraps an opaque `Int64` slot handle so it is `Send`, and
+// implements `net.stream.ByteStream`.
 
 use std.result.{Result, Ok, Err}
 use std.buf.{bufNew, bufPushStr, bufToString}
+use net.stream.ByteStream
 
 extern "gs_tls_connect_ex" def c_tls_connect_ex(host: String, port: Int, verify: Int, timeoutMs: Int): Int64
 extern "gs_tls_read" def c_tls_read(handle: Int64, buf: Ptr, cap: Int): Int
@@ -26,7 +27,6 @@ def lastTlsErr(fallback: String): String = {
     } else fallback
 }
 
-// Connect with SNI + system root CA & hostname verification (default 15s timeout).
 pub def tlsConnect(host: String, port: Int): Result TlsStream String =
     tlsConnectWithTimeout(host, port, 15000)
 
@@ -36,7 +36,6 @@ pub def tlsConnectWithTimeout(host: String, port: Int, timeoutMs: Int): Result T
     else Ok(TlsStream(h))
 }
 
-// Connect without certificate verification (for local/self-signed testing only).
 pub def tlsConnectInsecure(host: String, port: Int, timeoutMs: Int): Result TlsStream String = {
     let h = c_tls_connect_ex(host, port, 0, timeoutMs);
     if (h < intToI64(0)) Err(lastTlsErr("TLS connect failed to " + host))
@@ -44,10 +43,7 @@ pub def tlsConnectInsecure(host: String, port: Int, timeoutMs: Int): Result TlsS
 }
 
 pub def tlsClose(stream: TlsStream): Void = match stream {
-    TlsStream(h) -> {
-        let _ = c_tls_close(h);
-        ()
-    },
+    TlsStream(h) -> { let _ = c_tls_close(h); () },
 }
 
 pub def tlsReadPtr(stream: TlsStream, buf: Ptr, cap: Int): Result Int String = match stream {
@@ -126,4 +122,13 @@ pub def tlsWrite(stream: TlsStream, payload: String): Result Void String = match
             else Ok(())
         }
     },
+}
+
+instance ByteStream TlsStream {
+    def streamReadPtr(s, buf, cap) = tlsReadPtr(s, buf, cap)
+    def streamPeekPtr(s, buf, cap) = tlsPeekPtr(s, buf, cap)
+    def streamReadExactPtr(s, buf, count) = tlsReadExactPtr(s, buf, count)
+    def streamWritePtr(s, buf, len) = tlsWritePtr(s, buf, len)
+    def streamWrite(s, payload) = tlsWrite(s, payload)
+    def streamClose(s) = tlsClose(s)
 }

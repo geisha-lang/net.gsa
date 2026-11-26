@@ -1,35 +1,48 @@
-// Verification suite for `geisha-tls` (`tests/spec.gsa`).
+// Verification suite for `net.gsa` (`tests/spec.gsa`).
 
 use std.option.{Some, None}
 use std.result.{Result, Ok, Err}
 use std.str.intToStr
+use std.task.{spawn, await}
+use sys.net.{tcpListen, tcpLocalPort, tcpAccept, tcpCloseListener}
 use sys.io.eprintLn
 use sys.proc.exit
 
-use tls.hmac.hmacSha256Hex
-use tls.http.{HttpHeader, httpGet, httpHeaderGet, urlEncode, decodeChunkedBody}
+use net.ws.{WsText, wsAccept, wsConnect, wsSendText, wsSendTextMasked, wsRecv, wsClose}
+use net.http.{HttpHeader, httpsGet, httpHeaderGet, urlEncode, decodeChunkedBody}
 
 def assertTrue(label: String, ok: Bool): Result Void String =
     if (ok) Ok(()) else Err("ASSERT FAILED: " + label)
 
-def testHmacRfc4231(): Result Void String = {
-    // RFC 4231 Test Case 2: Key = "Jefe", Data = "what do ya want for nothing?"
-    let got1 = hmacSha256Hex("Jefe", "what do ya want for nothing?");
-    assertTrue(
-        "RFC 4231 TC2",
-        got1 == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-    )?;
+def testLoopbackWs(): Result Void String = {
+    let listener = tcpListen("127.0.0.1", 0)?;
+    let port = tcpLocalPort(listener);
 
-    // Binance official API doc HMAC-SHA256 example:
-    let secret = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
-    let query = "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559";
-    let got2 = hmacSha256Hex(secret, query);
-    assertTrue(
-        "Binance API HMAC-SHA256 vector",
-        got2 == "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
-    )?;
+    let srv = spawn(() -> {
+        let client = tcpAccept(listener)?;
+        let ws = wsAccept(client)?;
+        match wsRecv(ws) {
+            Ok(WsText(msg)) -> {
+                let _ = wsSendText(ws, "echo:" + msg)?;
+                wsClose(ws);
+                Ok(())
+            },
+            _ -> { wsClose(ws); Err("unexpected ws frame") },
+        }
+    });
 
-    printLn("  [PASS] tls.hmac: RFC 4231 + Binance API HMAC-SHA256 test vectors");
+    let c = wsConnect("127.0.0.1", port, "/chat")?;
+    wsSendTextMasked(c, "hello-net-gsa")?;
+    let reply = wsRecv(c)?;
+    wsClose(c);
+    let _ = await(srv)?;
+    tcpCloseListener(listener);
+
+    match reply {
+        WsText(s) -> assertTrue("WS loopback echo", s == "echo:hello-net-gsa")?,
+        _ -> assertTrue("expected WsText", false)?,
+    };
+    printLn("  [PASS] net.ws: concurrent RFC 6455 loopback server + client over ByteStream");
     Ok(())
 }
 
@@ -39,26 +52,26 @@ def testHttpHelpers(): Result Void String = {
     let decoded = decodeChunkedBody(chunked)?;
     assertTrue("decodeChunkedBody", decoded == "Wikipedia in\r\n\r\nchunks.")?;
 
-    let hs = [HttpHeader("Content-Type", "application/json"), HttpHeader("X-Rate-Limit", "42")];
+    let hs = [HttpHeader("Content-Type", "application/json")];
     match httpHeaderGet(hs, "content-type") {
         Some(v) -> assertTrue("case-insensitive header lookup", v == "application/json")?,
         None -> assertTrue("header missing", false)?,
     };
-    printLn("  [PASS] tls.http: URL encoding, chunked decoding & header lookup");
+    printLn("  [PASS] net.http: URL encoding, chunked decoding & header lookup");
     Ok(())
 }
 
 def testLiveHttps(): Result Void String = {
-    let resp = httpGet("example.com", "/")?;
-    assertTrue("HTTPS example.com status == 200 (got " + intToStr(resp.status) + ")", resp.status == 200)?;
+    let resp = httpsGet("example.com", "/")?;
+    assertTrue("HTTPS example.com status == 200", resp.status == 200)?;
     assertTrue("HTTPS example.com body non-empty", strLen(resp.body) > 100)?;
-    printLn("  [PASS] tls.http: live TLS 1.2/1.3 HTTPS GET example.com (CA+SNI verified, " + intToStr(strLen(resp.body)) + " bytes)");
+    printLn("  [PASS] net.tls + net.http: live TLS 1.2/1.3 HTTPS GET example.com (CA+SNI verified, " + intToStr(strLen(resp.body)) + " bytes)");
     Ok(())
 }
 
 def main(): Void = {
-    printLn("Running geisha-tls test suite...");
-    match testHmacRfc4231() {
+    printLn("Running net.gsa test suite...");
+    match testLoopbackWs() {
         Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
         Ok(_) ->
             match testHttpHelpers() {
@@ -66,7 +79,7 @@ def main(): Void = {
                 Ok(_) ->
                     match testLiveHttps() {
                         Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
-                        Ok(_) -> printLn("geisha-tls: all tests passed!"),
+                        Ok(_) -> printLn("net.gsa: all tests passed!"),
                     },
             },
     }

@@ -1,0 +1,461 @@
+// Pure-Geisha RFC 6455 WebSocket server & client (`net.ws`) generic over `ByteStream`.
+// Zero OpenSSL dependency: works over plain `TcpStream` (`ws://`) and `TlsStream` (`wss://` via `net.wss`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufPushPtr, bufToString}
+use std.str.{strTrim, strSplitChar}
+use sys.net.{TcpStream, tcpConnect}
+use net.stream.{
+    ByteStream,
+    streamPeekPtr, streamReadExactPtr, streamWrite, streamWritePtr, streamClose
+}
+
+pub data WsMessage {
+    WsText(String),
+    WsPing(String),
+    WsPong(String),
+    WsClose(Int, String),
+}
+
+pub data WsConn s {
+    WsConn(s),
+}
+
+// ---- Pure-Geisha SHA-1 (FIPS 180-4) for RFC 6455 handshake ----
+
+def rotl32(x: Int, n: Int): Int = (x << n) | (x >>> (32 - n))
+
+def sha1Bytes(input: String): MutArray Int = {
+    let msgLen = strLen(input);
+    let totalLen = ((msgLen + 9 + 63) / 64) * 64;
+    let buf = arrayNew(totalLen, 0);
+    let i = cellNew(0);
+    while (cellGet(i) < msgLen) {
+        let idx = cellGet(i);
+        arraySet(buf, idx, strByteAt(input, idx));
+        cellSet(i, idx + 1)
+    };
+    arraySet(buf, msgLen, 128);
+    let bitLen = intToI64(msgLen) * intToI64(8);
+    let bi = cellNew(0);
+    while (cellGet(bi) < 8) {
+        let k = cellGet(bi);
+        let shift = (7 - k) * 8;
+        arraySet(buf, totalLen - 8 + k, i64ToInt((bitLen >>> shift) & intToI64(255)));
+        cellSet(bi, k + 1)
+    };
+
+    let h0 = cellNew(1732584193);
+    let h1 = cellNew(-271733879);
+    let h2 = cellNew(-1732584194);
+    let h3 = cellNew(271733878);
+    let h4 = cellNew(-1009589776);
+
+    let w = arrayNew(80, 0);
+    let off = cellNew(0);
+    while (cellGet(off) < totalLen) {
+        let base = cellGet(off);
+        let j = cellNew(0);
+        while (cellGet(j) < 16) {
+            let k = cellGet(j);
+            let b0 = arrayGet(buf, base + k * 4);
+            let b1 = arrayGet(buf, base + k * 4 + 1);
+            let b2 = arrayGet(buf, base + k * 4 + 2);
+            let b3 = arrayGet(buf, base + k * 4 + 3);
+            arraySet(w, k, (b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
+            cellSet(j, k + 1)
+        };
+        let j2 = cellNew(16);
+        while (cellGet(j2) < 80) {
+            let k = cellGet(j2);
+            let xv = arrayGet(w, k - 3) ^ arrayGet(w, k - 8) ^ arrayGet(w, k - 14) ^ arrayGet(w, k - 16);
+            arraySet(w, k, rotl32(xv, 1));
+            cellSet(j2, k + 1)
+        };
+
+        let a = cellNew(cellGet(h0));
+        let b = cellNew(cellGet(h1));
+        let c = cellNew(cellGet(h2));
+        let d = cellNew(cellGet(h3));
+        let e = cellNew(cellGet(h4));
+
+        let r = cellNew(0);
+        while (cellGet(r) < 80) {
+            let round = cellGet(r);
+            let av = cellGet(a);
+            let bv = cellGet(b);
+            let cv = cellGet(c);
+            let dv = cellGet(d);
+            let ev = cellGet(e);
+            let fk = if (round < 20) {
+                ((bv & cv) | ((~bv) & dv)) + 1518500249
+            } else if (round < 40) {
+                (bv ^ cv ^ dv) + 1859775393
+            } else if (round < 60) {
+                ((bv & cv) | (bv & dv) | (cv & dv)) + (-1894007588)
+            } else {
+                (bv ^ cv ^ dv) + (-899497514)
+            };
+            let temp = rotl32(av, 5) + fk + ev + arrayGet(w, round);
+            cellSet(e, dv);
+            cellSet(d, cv);
+            cellSet(c, rotl32(bv, 30));
+            cellSet(b, av);
+            cellSet(a, temp);
+            cellSet(r, round + 1)
+        };
+
+        cellSet(h0, cellGet(h0) + cellGet(a));
+        cellSet(h1, cellGet(h1) + cellGet(b));
+        cellSet(h2, cellGet(h2) + cellGet(c));
+        cellSet(h3, cellGet(h3) + cellGet(d));
+        cellSet(h4, cellGet(h4) + cellGet(e));
+        cellSet(off, base + 64)
+    };
+
+    let digest = arrayNew(20, 0);
+    let words = arrayNew(5, 0);
+    arraySet(words, 0, cellGet(h0));
+    arraySet(words, 1, cellGet(h1));
+    arraySet(words, 2, cellGet(h2));
+    arraySet(words, 3, cellGet(h3));
+    arraySet(words, 4, cellGet(h4));
+    let wi = cellNew(0);
+    while (cellGet(wi) < 5) {
+        let k = cellGet(wi);
+        let word = arrayGet(words, k);
+        arraySet(digest, k * 4, (word >>> 24) & 255);
+        arraySet(digest, k * 4 + 1, (word >>> 16) & 255);
+        arraySet(digest, k * 4 + 2, (word >>> 8) & 255);
+        arraySet(digest, k * 4 + 3, word & 255);
+        cellSet(wi, k + 1)
+    };
+    digest
+}
+
+def base64EncodeBytes(bytes: MutArray Int, len: Int): String = {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let out = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < len) {
+        let idx = cellGet(i);
+        let b0 = arrayGet(bytes, idx) & 255;
+        let has1 = idx + 1 < len;
+        let has2 = idx + 2 < len;
+        let b1 = if (has1) arrayGet(bytes, idx + 1) & 255 else 0;
+        let b2 = if (has2) arrayGet(bytes, idx + 2) & 255 else 0;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        bufPushByte(out, strByteAt(alphabet, (triple >>> 18) & 63));
+        bufPushByte(out, strByteAt(alphabet, (triple >>> 12) & 63));
+        if (has1) bufPushByte(out, strByteAt(alphabet, (triple >>> 6) & 63))
+        else bufPushByte(out, 61);
+        if (has2) bufPushByte(out, strByteAt(alphabet, triple & 63))
+        else bufPushByte(out, 61);
+        cellSet(i, idx + 3)
+    };
+    bufToString(out)
+}
+
+pub def wsAcceptKey(clientKey: String): String = {
+    let digest = sha1Bytes(strTrim(clientKey) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64EncodeBytes(digest, 20)
+}
+
+// ---- HTTP Upgrade handshake (generic over `ByteStream s`) ----
+
+def asciiLower(s: String): String = {
+    let out = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        let lc = if (c >= 65 && c <= 90) c + 32 else c;
+        bufPushByte(out, lc);
+        cellSet(i, idx + 1)
+    };
+    bufToString(out)
+}
+
+def readHttpHeaders(stream): forall s. (ByteStream s) => s -> Result String String = {
+    let out = bufNew();
+    let chunkCap = 4096;
+    let chunk = ptrAllocBytes(chunkCap);
+    let count = cellNew(0);
+    let state = cellNew(0);
+    let failed = cellNew(false);
+    let err = cellNew("");
+    while (cellGet(state) < 4 && cellGet(count) < 16384 && !cellGet(failed)) {
+        match streamPeekPtr(stream, chunk, chunkCap) {
+            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+            Ok(n) ->
+                if (n == 0) {
+                    cellSet(err, "connection closed during HTTP upgrade handshake");
+                    cellSet(failed, true)
+                } else {
+                    let take = cellNew(0);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n && cellGet(state) < 4) {
+                        let idx = cellGet(i);
+                        let b = ptrByteAt(chunk, idx);
+                        let st = cellGet(state);
+                        if (st == 0 && b == 13) cellSet(state, 1)
+                        else if (st == 1 && b == 10) cellSet(state, 2)
+                        else if (st == 2 && b == 13) cellSet(state, 3)
+                        else if (st == 3 && b == 10) cellSet(state, 4)
+                        else if (b == 13) cellSet(state, 1)
+                        else cellSet(state, 0);
+                        cellSet(take, idx + 1);
+                        cellSet(i, idx + 1)
+                    };
+                    let consume = cellGet(take);
+                    match streamReadExactPtr(stream, chunk, consume) {
+                        Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
+                        Ok(_) -> {
+                            bufPushPtr(out, chunk, consume);
+                            cellSet(count, cellGet(count) + consume)
+                        },
+                    }
+                },
+        }
+    };
+    if (cellGet(failed)) Err(cellGet(err))
+    else if (cellGet(state) < 4) Err("HTTP upgrade header exceeded 16 KiB limit")
+    else Ok(bufToString(out))
+}
+
+def findHeaderValue(lines: List String, targetLower: String): Option String = match lines {
+    Nil -> None,
+    Cons(line, rest) -> {
+        let n = strLen(line);
+        let colon = cellNew(-1);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(colon) < 0) {
+            let idx = cellGet(i);
+            if (strByteAt(line, idx) == 58) cellSet(colon, idx) else ();
+            cellSet(i, idx + 1)
+        };
+        let cIdx = cellGet(colon);
+        if (cIdx > 0) {
+            let name = asciiLower(strTrim(strSlice(line, 0, cIdx)));
+            if (name == targetLower) Some(strTrim(strSlice(line, cIdx + 1, n)))
+            else findHeaderValue(rest, targetLower)
+        } else {
+            findHeaderValue(rest, targetLower)
+        }
+    },
+}
+
+pub def wsAccept(stream): forall s. (ByteStream s) => s -> Result (WsConn s) String = {
+    let raw = readHttpHeaders(stream)?;
+    let lines = strSplitChar(raw, '\n');
+    match findHeaderValue(lines, "sec-websocket-key") {
+        None -> Err("missing Sec-WebSocket-Key header"),
+        Some(key) -> {
+            let accept = wsAcceptKey(key);
+            let resp =
+                "HTTP/1.1 101 Switching Protocols\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            let _ = streamWrite(stream, resp)?;
+            Ok(WsConn(stream))
+        },
+    }
+}
+
+pub def wsUpgradeClient(stream, host, path, extraHeaderLines): forall s. (ByteStream s) => (s, String, String, String) -> Result (WsConn s) String = {
+    let reqPath = if (strLen(path) == 0) "/" else path;
+    let clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
+    let req =
+        "GET " + reqPath + " HTTP/1.1\r\n" +
+        "Host: " + host + "\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: " + clientKey + "\r\n" +
+        "Sec-WebSocket-Version: 13\r\n" +
+        extraHeaderLines + "\r\n";
+    match streamWrite(stream, req) {
+        Err(e) -> { streamClose(stream); Err(e) },
+        Ok(_) ->
+            match readHttpHeaders(stream) {
+                Err(e) -> { streamClose(stream); Err(e) },
+                Ok(resp) -> {
+                    let lines = strSplitChar(resp, '\n');
+                    let expected = wsAcceptKey(clientKey);
+                    match findHeaderValue(lines, "sec-websocket-accept") {
+                        Some(got) if (got == expected) -> Ok(WsConn(stream)),
+                        _ -> {
+                            streamClose(stream);
+                            Err("invalid Sec-WebSocket-Accept response from server")
+                        },
+                    }
+                },
+            },
+    }
+}
+
+pub def wsConnect(host: String, port: Int, path: String): Result (WsConn TcpStream) String = {
+    let stream = tcpConnect(host, port)?;
+    wsUpgradeClient(stream, host, path, "")
+}
+
+pub def wsClose(conn): forall s. (ByteStream s) => WsConn s -> Void = match conn {
+    WsConn(stream) -> streamClose(stream),
+}
+
+// ---- RFC 6455 Framing (generic over `ByteStream s`) ----
+
+pub def wsRecv(conn): forall s. (ByteStream s) => WsConn s -> Result WsMessage String = match conn {
+    WsConn(stream) -> {
+        let hdr = ptrAllocBytes(2);
+        let _ = streamReadExactPtr(stream, hdr, 2)?;
+        let b0 = ptrByteAt(hdr, 0) & 255;
+        let b1 = ptrByteAt(hdr, 1) & 255;
+        let opcode = b0 & 15;
+        let masked = (b1 & 128) != 0;
+        let len7 = b1 & 127;
+
+        let payloadLen = if (len7 < 126) {
+            len7
+        } else if (len7 == 126) {
+            let ext2 = ptrAllocBytes(2);
+            let _ = streamReadExactPtr(stream, ext2, 2)?;
+            ((ptrByteAt(ext2, 0) & 255) << 8) | (ptrByteAt(ext2, 1) & 255)
+        } else {
+            let ext8 = ptrAllocBytes(8);
+            let _ = streamReadExactPtr(stream, ext8, 8)?;
+            let hi = ((ptrByteAt(ext8, 0) & 255) << 24) |
+                     ((ptrByteAt(ext8, 1) & 255) << 16) |
+                     ((ptrByteAt(ext8, 2) & 255) << 8) |
+                     (ptrByteAt(ext8, 3) & 255);
+            let lo = ((ptrByteAt(ext8, 4) & 255) << 24) |
+                     ((ptrByteAt(ext8, 5) & 255) << 16) |
+                     ((ptrByteAt(ext8, 6) & 255) << 8) |
+                     (ptrByteAt(ext8, 7) & 255);
+            if (hi != 0 || lo < 0) -1 else lo
+        };
+
+        if (payloadLen < 0 || payloadLen > 16777216) {
+            Err("unsupported WebSocket payload length")
+        } else {
+            let maskKey = ptrAllocBytes(4);
+            if (masked) {
+                let _ = streamReadExactPtr(stream, maskKey, 4)?;
+                ()
+            } else ();
+
+            let payload = ptrAllocBytes(if (payloadLen == 0) 1 else payloadLen);
+            if (payloadLen > 0) {
+                let _ = streamReadExactPtr(stream, payload, payloadLen)?;
+                if (masked) {
+                    let i = cellNew(0);
+                    while (cellGet(i) < payloadLen) {
+                        let idx = cellGet(i);
+                        let raw = ptrByteAt(payload, idx) & 255;
+                        let mk = ptrByteAt(maskKey, idx & 3) & 255;
+                        ptrSetByte(payload, idx, raw ^ mk);
+                        cellSet(i, idx + 1)
+                    }
+                } else ()
+            } else ();
+
+            if (opcode == 1) {
+                Ok(WsText(ptrSliceToString(payload, payloadLen)))
+            } else if (opcode == 9) {
+                Ok(WsPing(ptrSliceToString(payload, payloadLen)))
+            } else if (opcode == 10) {
+                Ok(WsPong(ptrSliceToString(payload, payloadLen)))
+            } else if (opcode == 8) {
+                if (payloadLen >= 2) {
+                    let code = ((ptrByteAt(payload, 0) & 255) << 8) | (ptrByteAt(payload, 1) & 255);
+                    let out = bufNew();
+                    let j = cellNew(2);
+                    while (cellGet(j) < payloadLen) {
+                        let idx = cellGet(j);
+                        bufPushByte(out, ptrByteAt(payload, idx));
+                        cellSet(j, idx + 1)
+                    };
+                    Ok(WsClose(code, bufToString(out)))
+                } else {
+                    Ok(WsClose(1000, ""))
+                }
+            } else {
+                Err("unsupported WebSocket opcode")
+            }
+        }
+    },
+}
+
+def wsSendFrame(conn, opcode, payload, masked): forall s. (ByteStream s) => (WsConn s, Int, String, Bool) -> Result Void String = match conn {
+    WsConn(stream) -> {
+        let n = strLen(payload);
+        let hdrLen = if (n < 126) 2 else if (n < 65536) 4 else 10;
+        let maskLen = if (masked) 4 else 0;
+        let total = hdrLen + maskLen + n;
+        let frame = ptrAllocBytes(total);
+        ptrSetByte(frame, 0, 128 | (opcode & 15));
+        let maskBit = if (masked) 128 else 0;
+        if (n < 126) {
+            ptrSetByte(frame, 1, maskBit | n)
+        } else if (n < 65536) {
+            ptrSetByte(frame, 1, maskBit | 126);
+            ptrSetByte(frame, 2, (n >>> 8) & 255);
+            ptrSetByte(frame, 3, n & 255)
+        } else {
+            ptrSetByte(frame, 1, maskBit | 127);
+            ptrSetByte(frame, 2, 0);
+            ptrSetByte(frame, 3, 0);
+            ptrSetByte(frame, 4, 0);
+            ptrSetByte(frame, 5, 0);
+            ptrSetByte(frame, 6, (n >>> 24) & 255);
+            ptrSetByte(frame, 7, (n >>> 16) & 255);
+            ptrSetByte(frame, 8, (n >>> 8) & 255);
+            ptrSetByte(frame, 9, n & 255)
+        };
+        if (masked) {
+            ptrSetByte(frame, hdrLen, 55);
+            ptrSetByte(frame, hdrLen + 1, 250);
+            ptrSetByte(frame, hdrLen + 2, 33);
+            ptrSetByte(frame, hdrLen + 3, 61);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let b = strByteAt(payload, idx) & 255;
+                let mk = ptrByteAt(frame, hdrLen + (idx & 3)) & 255;
+                ptrSetByte(frame, hdrLen + 4 + idx, b ^ mk);
+                cellSet(i, idx + 1)
+            }
+        } else {
+            if (n > 0) ptrCopyFromStr(frame, hdrLen, payload, n) else ()
+        };
+        streamWritePtr(stream, frame, total)
+    },
+}
+
+pub def wsSendText(conn, text): forall s. (ByteStream s) => (WsConn s, String) -> Result Void String =
+    wsSendFrame(conn, 1, text, false)
+
+pub def wsSendTextMasked(conn, text): forall s. (ByteStream s) => (WsConn s, String) -> Result Void String =
+    wsSendFrame(conn, 1, text, true)
+
+pub def wsSendPing(conn, payload): forall s. (ByteStream s) => (WsConn s, String) -> Result Void String =
+    wsSendFrame(conn, 9, payload, false)
+
+pub def wsSendPong(conn, payload): forall s. (ByteStream s) => (WsConn s, String) -> Result Void String =
+    wsSendFrame(conn, 10, payload, false)
+
+pub def wsSendClose(conn, code, reason): forall s. (ByteStream s) => (WsConn s, Int, String) -> Result Void String = match conn {
+    WsConn(stream) -> {
+        let rLen = strLen(reason);
+        let pLen = 2 + rLen;
+        let frame = ptrAllocBytes(2 + pLen);
+        ptrSetByte(frame, 0, 136);
+        ptrSetByte(frame, 1, pLen & 127);
+        ptrSetByte(frame, 2, (code >>> 8) & 255);
+        ptrSetByte(frame, 3, code & 255);
+        if (rLen > 0) ptrCopyFromStr(frame, 4, reason, rLen) else ();
+        streamWritePtr(stream, frame, 2 + pLen)
+    },
+}

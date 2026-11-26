@@ -1,11 +1,15 @@
-// HTTP/1.1 client over TLS (`tls.http`).
-// Supports custom headers, Content-Length, Transfer-Encoding: chunked, and URL encoding.
+// HTTP/1.1 & HTTPS client (`net.http`) generic over `net.stream.ByteStream`.
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.buf.{bufNew, bufPushByte, bufPushStr, bufPushPtr, bufToString}
 use std.str.{intToStr, parseInt, strTrim, strSplitChar}
-use tls.tls.{TlsStream, tlsConnectWithTimeout, tlsReadPtr, tlsPeekPtr, tlsReadExactPtr, tlsWrite, tlsClose}
+use sys.net.tcpConnect
+use net.stream.{
+    ByteStream,
+    streamReadPtr, streamPeekPtr, streamReadExactPtr, streamWrite, streamClose
+}
+use net.tls.tlsConnectWithTimeout
 
 pub data HttpHeader {
     HttpHeader(String, String),
@@ -118,7 +122,7 @@ def parseHeadersList(lines: List String): List HttpHeader = match lines {
     },
 }
 
-def readHttpHeaderBlock(stream: TlsStream): Result String String = {
+def readHttpHeaderBlock(stream): forall s. (ByteStream s) => s -> Result String String = {
     let out = bufNew();
     let chunkCap = 4096;
     let chunk = ptrAllocBytes(chunkCap);
@@ -127,7 +131,7 @@ def readHttpHeaderBlock(stream: TlsStream): Result String String = {
     let failed = cellNew(false);
     let err = cellNew("");
     while (cellGet(state) < 4 && cellGet(count) < 65536 && !cellGet(failed)) {
-        match tlsPeekPtr(stream, chunk, chunkCap) {
+        match streamPeekPtr(stream, chunk, chunkCap) {
             Err(e) -> { cellSet(err, e); cellSet(failed, true) },
             Ok(n) ->
                 if (n == 0) {
@@ -150,7 +154,7 @@ def readHttpHeaderBlock(stream: TlsStream): Result String String = {
                         cellSet(i, idx + 1)
                     };
                     let consume = cellGet(take);
-                    match tlsReadExactPtr(stream, chunk, consume) {
+                    match streamReadExactPtr(stream, chunk, consume) {
                         Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
                         Ok(_) -> {
                             bufPushPtr(out, chunk, consume);
@@ -165,15 +169,15 @@ def readHttpHeaderBlock(stream: TlsStream): Result String String = {
     else Ok(bufToString(out))
 }
 
-def readExactToString(stream: TlsStream, len: Int): Result String String =
+def readExactToString(stream, len): forall s. (ByteStream s) => (s, Int) -> Result String String =
     if (len <= 0) Ok("")
     else {
         let buf = ptrAllocBytes(len);
-        let _ = tlsReadExactPtr(stream, buf, len)?;
+        let _ = streamReadExactPtr(stream, buf, len)?;
         Ok(ptrSliceToString(buf, len))
     }
 
-def readUntilEof(stream: TlsStream): Result String String = {
+def readUntilEof(stream): forall s. (ByteStream s) => s -> Result String String = {
     let out = bufNew();
     let chunkCap = 16384;
     let chunk = ptrAllocBytes(chunkCap);
@@ -181,7 +185,7 @@ def readUntilEof(stream: TlsStream): Result String String = {
     let failed = cellNew(false);
     let err = cellNew("");
     while (!cellGet(done) && !cellGet(failed)) {
-        match tlsReadPtr(stream, chunk, chunkCap) {
+        match streamReadPtr(stream, chunk, chunkCap) {
             Err(e) -> { cellSet(err, e); cellSet(failed, true) },
             Ok(n) ->
                 if (n == 0) cellSet(done, true)
@@ -203,7 +207,6 @@ def parseHexInt(raw: String): Result Int String = {
         while (cellGet(i) < n && !cellGet(bad)) {
             let b = strByteAt(s, cellGet(i));
             if (b == 59) {
-                // ';' chunk extension
                 cellSet(i, n)
             } else if (b >= 48 && b <= 57) {
                 cellSet(acc, cellGet(acc) * 16 + (b - 48));
@@ -257,7 +260,6 @@ pub def decodeChunkedBody(raw: String): Result String String = {
                             cellSet(failed, true)
                         } else {
                             bufPushStr(out, strSlice(raw, dataStart, dataEnd));
-                            // Skip trailing CRLF after chunk data
                             let nextPos =
                                 if (dataEnd + 1 < n && strByteAt(raw, dataEnd) == 13 && strByteAt(raw, dataEnd + 1) == 10) dataEnd + 2
                                 else if (dataEnd < n && strByteAt(raw, dataEnd) == 10) dataEnd + 1
@@ -305,16 +307,7 @@ def containsSubstr(haystack: String, needle: String): Bool = {
     }
 }
 
-pub def httpRequest(
-    method: String,
-    host: String,
-    port: Int,
-    path: String,
-    headers: List HttpHeader,
-    body: String,
-    timeoutMs: Int
-): Result HttpResponse String = {
-    let stream = tlsConnectWithTimeout(host, port, timeoutMs)?;
+pub def httpRequestOn(stream, method, host, port, defaultPort, path, headers, body): forall s. (ByteStream s) => (s, String, String, Int, Int, String, List HttpHeader, String) -> Result HttpResponse String = {
     let reqPath = if (strLen(path) == 0) "/" else path;
     let req = bufNew();
     bufPushStr(req, method);
@@ -324,14 +317,14 @@ pub def httpRequest(
     if (!hasHeaderName(headers, "host")) {
         bufPushStr(req, "Host: ");
         bufPushStr(req, host);
-        if (port != 443) {
+        if (port != defaultPort) {
             bufPushStr(req, ":");
             bufPushStr(req, intToStr(port))
         } else ();
         bufPushStr(req, "\r\n")
     } else ();
     if (!hasHeaderName(headers, "user-agent")) {
-        bufPushStr(req, "User-Agent: geisha-tls/0.1\r\n")
+        bufPushStr(req, "User-Agent: net.gsa/0.1\r\n")
     } else ();
     if (!hasHeaderName(headers, "connection")) {
         bufPushStr(req, "Connection: close\r\n")
@@ -346,18 +339,18 @@ pub def httpRequest(
     bufPushStr(req, "\r\n");
     if (bodyLen > 0) bufPushStr(req, body) else ();
 
-    match tlsWrite(stream, bufToString(req)) {
-        Err(e) -> { tlsClose(stream); Err(e) },
+    match streamWrite(stream, bufToString(req)) {
+        Err(e) -> { streamClose(stream); Err(e) },
         Ok(_) ->
             match readHttpHeaderBlock(stream) {
-                Err(e) -> { tlsClose(stream); Err(e) },
+                Err(e) -> { streamClose(stream); Err(e) },
                 Ok(rawHdr) -> {
                     let lines = strSplitChar(rawHdr, '\n');
                     match lines {
-                        Nil -> { tlsClose(stream); Err("empty HTTP response") },
+                        Nil -> { streamClose(stream); Err("empty HTTP response") },
                         Cons(statusLine, hdrLines) ->
                             match parseStatusLine(statusLine) {
-                                Err(e) -> { tlsClose(stream); Err(e) },
+                                Err(e) -> { streamClose(stream); Err(e) },
                                 Ok(code) -> {
                                     let respHeaders = parseHeadersList(hdrLines);
                                     let isChunked = match httpHeaderGet(respHeaders, "transfer-encoding") {
@@ -380,7 +373,7 @@ pub def httpRequest(
                                                 None -> readUntilEof(stream),
                                             }
                                         };
-                                    tlsClose(stream);
+                                    streamClose(stream);
                                     match bodyRes {
                                         Err(e) -> Err(e),
                                         Ok(respBody) -> Ok(MkHttpResponse {
@@ -397,11 +390,39 @@ pub def httpRequest(
     }
 }
 
-pub def httpGet(host: String, path: String): Result HttpResponse String =
-    httpRequest("GET", host, 443, path, Nil, "", 15000)
+pub def httpsRequest(
+    method: String,
+    host: String,
+    port: Int,
+    path: String,
+    headers: List HttpHeader,
+    body: String,
+    timeoutMs: Int
+): Result HttpResponse String = {
+    let stream = tlsConnectWithTimeout(host, port, timeoutMs)?;
+    httpRequestOn(stream, method, host, port, 443, path, headers, body)
+}
 
-pub def httpGetHeaders(host: String, path: String, headers: List HttpHeader): Result HttpResponse String =
-    httpRequest("GET", host, 443, path, headers, "", 15000)
+pub def httpsGet(host: String, path: String): Result HttpResponse String =
+    httpsRequest("GET", host, 443, path, Nil, "", 15000)
 
-pub def httpPost(host: String, path: String, headers: List HttpHeader, body: String): Result HttpResponse String =
-    httpRequest("POST", host, 443, path, headers, body, 15000)
+pub def httpsGetHeaders(host: String, path: String, headers: List HttpHeader): Result HttpResponse String =
+    httpsRequest("GET", host, 443, path, headers, "", 15000)
+
+pub def httpsPost(host: String, path: String, headers: List HttpHeader, body: String): Result HttpResponse String =
+    httpsRequest("POST", host, 443, path, headers, body, 15000)
+
+pub def httpRequest(
+    method: String,
+    host: String,
+    port: Int,
+    path: String,
+    headers: List HttpHeader,
+    body: String
+): Result HttpResponse String = {
+    let stream = tcpConnect(host, port)?;
+    httpRequestOn(stream, method, host, port, 80, path, headers, body)
+}
+
+pub def httpGet(host: String, port: Int, path: String): Result HttpResponse String =
+    httpRequest("GET", host, port, path, Nil, "")

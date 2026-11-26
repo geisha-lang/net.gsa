@@ -1,0 +1,25 @@
+// Unified byte-stream abstraction (`net.stream`) over TCP and TLS.
+
+use std.result.Result
+use sys.net.{
+    TcpStream, tcpReadPtr, tcpPeekPtr, tcpReadExactPtr,
+    tcpWritePtr, tcpWrite, tcpClose
+}
+
+pub concept ByteStream s {
+    def streamReadPtr(s: s, buf: Ptr, cap: Int): Result Int String,
+    def streamPeekPtr(s: s, buf: Ptr, cap: Int): Result Int String,
+    def streamReadExactPtr(s: s, buf: Ptr, count: Int): Result Void String,
+    def streamWritePtr(s: s, buf: Ptr, len: Int): Result Void String,
+    def streamWrite(s: s, payload: String): Result Void String,
+    def streamClose(s: s): Void
+}
+
+instance ByteStream TcpStream {
+    def streamReadPtr(s, buf, cap) = tcpReadPtr(s, buf, cap)
+    def streamPeekPtr(s, buf, cap) = tcpPeekPtr(s, buf, cap)
+    def streamReadExactPtr(s, buf, count) = tcpReadExactPtr(s, buf, count)
+    def streamWritePtr(s, buf, len) = tcpWritePtr(s, buf, len)
+    def streamWrite(s, payload) = tcpWrite(s, payload)
+    def streamClose(s) = tcpClose(s)
+}

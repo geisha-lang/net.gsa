@@ -1,114 +1,31 @@
-// RFC 6455 WebSocket client over TLS (`tls.wss`).
-// Reuses `std.ws.WsMessage` and `std.ws.wsAcceptKey`.
-// `WssConn` wraps `TlsStream` (which wraps `Int64`), so it is `Send`.
+// WebSocket over TLS (`net.wss`) — thin wrapper over `net.tls` + generic `net.ws`.
+// Returned `WsConn TlsStream` uses the exact same `wsRecv`, `wsSendTextMasked`,
+// `wsSendPong`, and `wsClose` from `net.ws`.
 
-use std.option.{Option, Some, None}
-use std.result.{Result, Ok, Err}
-use std.buf.{bufNew, bufPushByte, bufPushStr, bufPushPtr, bufToString}
-use std.str.{strTrim, strSplitChar}
-use std.ws.{WsMessage, WsText, WsPing, WsPong, WsClose, wsAcceptKey}
-use tls.tls.{TlsStream, tlsConnectWithTimeout, tlsPeekPtr, tlsReadExactPtr, tlsWrite, tlsWritePtr, tlsClose}
-use tls.http.{HttpHeader}
+use std.result.Result
+use std.buf.{bufNew, bufPushStr, bufToString}
+use net.tls.{TlsStream, tlsConnectWithTimeout}
+use net.ws.{WsConn, wsUpgradeClient}
+use net.http.HttpHeader
 
-pub data WssConn {
-    WssConn(TlsStream),
-}
-
-def asciiLower(s: String): String = {
+def formatExtraHeaders(headers: List HttpHeader): String = {
     let out = bufNew();
-    let n = strLen(s);
-    let i = cellNew(0);
-    while (cellGet(i) < n) {
-        let idx = cellGet(i);
-        let c = strByteAt(s, idx);
-        let lc = if (c >= 65 && c <= 90) c + 32 else c;
-        bufPushByte(out, lc);
-        cellSet(i, idx + 1)
-    };
+    formatExtraRec(out, headers);
     bufToString(out)
 }
 
-def readUpgradeHeaders(stream: TlsStream): Result String String = {
-    let out = bufNew();
-    let chunkCap = 4096;
-    let chunk = ptrAllocBytes(chunkCap);
-    let count = cellNew(0);
-    let state = cellNew(0);
-    let failed = cellNew(false);
-    let err = cellNew("");
-    while (cellGet(state) < 4 && cellGet(count) < 16384 && !cellGet(failed)) {
-        match tlsPeekPtr(stream, chunk, chunkCap) {
-            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
-            Ok(n) ->
-                if (n == 0) {
-                    cellSet(err, "connection closed during WSS upgrade handshake");
-                    cellSet(failed, true)
-                } else {
-                    let take = cellNew(0);
-                    let i = cellNew(0);
-                    while (cellGet(i) < n && cellGet(state) < 4) {
-                        let idx = cellGet(i);
-                        let b = ptrByteAt(chunk, idx);
-                        let st = cellGet(state);
-                        if (st == 0 && b == 13) cellSet(state, 1)
-                        else if (st == 1 && b == 10) cellSet(state, 2)
-                        else if (st == 2 && b == 13) cellSet(state, 3)
-                        else if (st == 3 && b == 10) cellSet(state, 4)
-                        else if (b == 13) cellSet(state, 1)
-                        else cellSet(state, 0);
-                        cellSet(take, idx + 1);
-                        cellSet(i, idx + 1)
-                    };
-                    let consume = cellGet(take);
-                    match tlsReadExactPtr(stream, chunk, consume) {
-                        Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
-                        Ok(_) -> {
-                            bufPushPtr(out, chunk, consume);
-                            cellSet(count, cellGet(count) + consume)
-                        },
-                    }
-                },
-        }
-    };
-    if (cellGet(failed)) Err(cellGet(err))
-    else if (cellGet(state) < 4) Err("WSS upgrade header exceeded 16 KiB limit")
-    else Ok(bufToString(out))
-}
-
-def findHeaderValue(lines: List String, targetLower: String): Option String = match lines {
-    Nil -> None,
-    Cons(line, rest) -> {
-        let n = strLen(line);
-        let colon = cellNew(-1);
-        let i = cellNew(0);
-        while (cellGet(i) < n && cellGet(colon) < 0) {
-            let idx = cellGet(i);
-            if (strByteAt(line, idx) == 58) cellSet(colon, idx) else ();
-            cellSet(i, idx + 1)
-        };
-        let cIdx = cellGet(colon);
-        if (cIdx > 0) {
-            let name = asciiLower(strTrim(strSlice(line, 0, cIdx)));
-            if (name == targetLower) Some(strTrim(strSlice(line, cIdx + 1, n)))
-            else findHeaderValue(rest, targetLower)
-        } else {
-            findHeaderValue(rest, targetLower)
-        }
-    },
-}
-
-def pushExtraHeaders(buf: std.buf.StringBuf, headers: List HttpHeader): Void = match headers {
+def formatExtraRec(out: std.buf.StringBuf, headers: List HttpHeader): Void = match headers {
     Nil -> (),
     Cons(HttpHeader(k, v), rest) -> {
-        bufPushStr(buf, k);
-        bufPushStr(buf, ": ");
-        bufPushStr(buf, v);
-        bufPushStr(buf, "\r\n");
-        pushExtraHeaders(buf, rest)
+        bufPushStr(out, k);
+        bufPushStr(out, ": ");
+        bufPushStr(out, v);
+        bufPushStr(out, "\r\n");
+        formatExtraRec(out, rest)
     },
 }
 
-pub def wssConnect(host: String, port: Int, path: String): Result WssConn String =
+pub def wssConnect(host: String, port: Int, path: String): Result (WsConn TlsStream) String =
     wssConnectWithHeaders(host, port, path, Nil, 15000)
 
 pub def wssConnectWithHeaders(
@@ -117,182 +34,7 @@ pub def wssConnectWithHeaders(
     path: String,
     extraHeaders: List HttpHeader,
     timeoutMs: Int
-): Result WssConn String = {
+): Result (WsConn TlsStream) String = {
     let stream = tlsConnectWithTimeout(host, port, timeoutMs)?;
-    let reqPath = if (strLen(path) == 0) "/" else path;
-    let clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
-    let req = bufNew();
-    bufPushStr(req, "GET ");
-    bufPushStr(req, reqPath);
-    bufPushStr(req, " HTTP/1.1\r\n");
-    bufPushStr(req, "Host: ");
-    bufPushStr(req, host);
-    bufPushStr(req, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
-    bufPushStr(req, clientKey);
-    bufPushStr(req, "\r\nSec-WebSocket-Version: 13\r\n");
-    pushExtraHeaders(req, extraHeaders);
-    bufPushStr(req, "\r\n");
-
-    match tlsWrite(stream, bufToString(req)) {
-        Err(e) -> { tlsClose(stream); Err(e) },
-        Ok(_) ->
-            match readUpgradeHeaders(stream) {
-                Err(e) -> { tlsClose(stream); Err(e) },
-                Ok(resp) -> {
-                    let lines = strSplitChar(resp, '\n');
-                    let expected = wsAcceptKey(clientKey);
-                    match findHeaderValue(lines, "sec-websocket-accept") {
-                        Some(got) if (got == expected) -> Ok(WssConn(stream)),
-                        _ -> {
-                            tlsClose(stream);
-                            Err("invalid Sec-WebSocket-Accept response from WSS server")
-                        },
-                    }
-                },
-            },
-    }
-}
-
-pub def wssClose(conn: WssConn): Void = match conn {
-    WssConn(stream) -> tlsClose(stream),
-}
-
-pub def wssRecv(conn: WssConn): Result WsMessage String = match conn {
-    WssConn(stream) -> {
-        let hdr = ptrAllocBytes(2);
-        let _ = tlsReadExactPtr(stream, hdr, 2)?;
-        let b0 = ptrByteAt(hdr, 0) & 255;
-        let b1 = ptrByteAt(hdr, 1) & 255;
-        let opcode = b0 & 15;
-        let masked = (b1 & 128) != 0;
-        let len7 = b1 & 127;
-
-        let payloadLen = if (len7 < 126) {
-            len7
-        } else if (len7 == 126) {
-            let ext2 = ptrAllocBytes(2);
-            let _ = tlsReadExactPtr(stream, ext2, 2)?;
-            ((ptrByteAt(ext2, 0) & 255) << 8) | (ptrByteAt(ext2, 1) & 255)
-        } else {
-            let ext8 = ptrAllocBytes(8);
-            let _ = tlsReadExactPtr(stream, ext8, 8)?;
-            let hi = ((ptrByteAt(ext8, 0) & 255) << 24) |
-                     ((ptrByteAt(ext8, 1) & 255) << 16) |
-                     ((ptrByteAt(ext8, 2) & 255) << 8) |
-                     (ptrByteAt(ext8, 3) & 255);
-            let lo = ((ptrByteAt(ext8, 4) & 255) << 24) |
-                     ((ptrByteAt(ext8, 5) & 255) << 16) |
-                     ((ptrByteAt(ext8, 6) & 255) << 8) |
-                     (ptrByteAt(ext8, 7) & 255);
-            if (hi != 0 || lo < 0) -1 else lo
-        };
-
-        if (payloadLen < 0 || payloadLen > 16777216) {
-            Err("unsupported WebSocket payload length")
-        } else {
-            let maskKey = ptrAllocBytes(4);
-            if (masked) {
-                let _ = tlsReadExactPtr(stream, maskKey, 4)?;
-                ()
-            } else ();
-
-            let payload = ptrAllocBytes(if (payloadLen == 0) 1 else payloadLen);
-            if (payloadLen > 0) {
-                let _ = tlsReadExactPtr(stream, payload, payloadLen)?;
-                if (masked) {
-                    let i = cellNew(0);
-                    while (cellGet(i) < payloadLen) {
-                        let idx = cellGet(i);
-                        let raw = ptrByteAt(payload, idx) & 255;
-                        let mk = ptrByteAt(maskKey, idx & 3) & 255;
-                        ptrSetByte(payload, idx, raw ^ mk);
-                        cellSet(i, idx + 1)
-                    }
-                } else ()
-            } else ();
-
-            if (opcode == 1) {
-                Ok(WsText(ptrSliceToString(payload, payloadLen)))
-            } else if (opcode == 9) {
-                Ok(WsPing(ptrSliceToString(payload, payloadLen)))
-            } else if (opcode == 10) {
-                Ok(WsPong(ptrSliceToString(payload, payloadLen)))
-            } else if (opcode == 8) {
-                if (payloadLen >= 2) {
-                    let code = ((ptrByteAt(payload, 0) & 255) << 8) | (ptrByteAt(payload, 1) & 255);
-                    let out = bufNew();
-                    let j = cellNew(2);
-                    while (cellGet(j) < payloadLen) {
-                        let idx = cellGet(j);
-                        bufPushByte(out, ptrByteAt(payload, idx));
-                        cellSet(j, idx + 1)
-                    };
-                    Ok(WsClose(code, bufToString(out)))
-                } else {
-                    Ok(WsClose(1000, ""))
-                }
-            } else {
-                Err("unsupported WebSocket opcode")
-            }
-        }
-    },
-}
-
-// RFC 6455 requires client-to-server frames to be masked.
-def wssSendFrame(conn: WssConn, opcode: Int, payload: String): Result Void String = match conn {
-    WssConn(stream) -> {
-        let n = strLen(payload);
-        let hdrLen = if (n < 126) 2 else if (n < 65536) 4 else 10;
-        let total = hdrLen + 4 + n;
-        let frame = ptrAllocBytes(total);
-        ptrSetByte(frame, 0, 128 | (opcode & 15));
-        if (n < 126) {
-            ptrSetByte(frame, 1, 128 | n)
-        } else if (n < 65536) {
-            ptrSetByte(frame, 1, 128 | 126);
-            ptrSetByte(frame, 2, (n >>> 8) & 255);
-            ptrSetByte(frame, 3, n & 255)
-        } else {
-            ptrSetByte(frame, 1, 128 | 127);
-            ptrSetByte(frame, 2, 0);
-            ptrSetByte(frame, 3, 0);
-            ptrSetByte(frame, 4, 0);
-            ptrSetByte(frame, 5, 0);
-            ptrSetByte(frame, 6, (n >>> 24) & 255);
-            ptrSetByte(frame, 7, (n >>> 16) & 255);
-            ptrSetByte(frame, 8, (n >>> 8) & 255);
-            ptrSetByte(frame, 9, n & 255)
-        };
-        ptrSetByte(frame, hdrLen, 55);
-        ptrSetByte(frame, hdrLen + 1, 250);
-        ptrSetByte(frame, hdrLen + 2, 33);
-        ptrSetByte(frame, hdrLen + 3, 61);
-        let i = cellNew(0);
-        while (cellGet(i) < n) {
-            let idx = cellGet(i);
-            let b = strByteAt(payload, idx) & 255;
-            let mk = ptrByteAt(frame, hdrLen + (idx & 3)) & 255;
-            ptrSetByte(frame, hdrLen + 4 + idx, b ^ mk);
-            cellSet(i, idx + 1)
-        };
-        tlsWritePtr(stream, frame, total)
-    },
-}
-
-pub def wssSendText(conn: WssConn, text: String): Result Void String =
-    wssSendFrame(conn, 1, text)
-
-pub def wssSendPing(conn: WssConn, payload: String): Result Void String =
-    wssSendFrame(conn, 9, payload)
-
-pub def wssSendPong(conn: WssConn, payload: String): Result Void String =
-    wssSendFrame(conn, 10, payload)
-
-pub def wssSendClose(conn: WssConn, code: Int, reason: String): Result Void String = {
-    let rLen = strLen(reason);
-    let buf = ptrAllocBytes(2 + rLen);
-    ptrSetByte(buf, 0, (code >>> 8) & 255);
-    ptrSetByte(buf, 1, code & 255);
-    if (rLen > 0) ptrCopyFromStr(buf, 2, reason, rLen) else ();
-    wssSendFrame(conn, 8, ptrSliceToString(buf, 2 + rLen))
+    wsUpgradeClient(stream, host, path, formatExtraHeaders(extraHeaders))
 }
