@@ -1,0 +1,407 @@
+// HTTP/1.1 client over TLS (`tls.http`).
+// Supports custom headers, Content-Length, Transfer-Encoding: chunked, and URL encoding.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufPushPtr, bufToString}
+use std.str.{intToStr, parseInt, strTrim, strSplitChar}
+use tls.tls.{TlsStream, tlsConnectWithTimeout, tlsReadPtr, tlsPeekPtr, tlsReadExactPtr, tlsWrite, tlsClose}
+
+pub data HttpHeader {
+    HttpHeader(String, String),
+}
+
+pub data HttpResponse {
+    MkHttpResponse {
+        status: Int,
+        headers: List HttpHeader,
+        body: String,
+    },
+}
+
+def asciiLower(s: String): String = {
+    let out = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        let lc = if (c >= 65 && c <= 90) c + 32 else c;
+        bufPushByte(out, lc);
+        cellSet(i, idx + 1)
+    };
+    bufToString(out)
+}
+
+def hexUpperByte(nib: Int): Int =
+    if (nib < 10) 48 + nib else 55 + nib
+
+def isUnreservedByte(b: Int): Bool =
+    (b >= 65 && b <= 90) ||
+    (b >= 97 && b <= 122) ||
+    (b >= 48 && b <= 57) ||
+    b == 45 || b == 46 || b == 95 || b == 126
+
+pub def urlEncode(s: String): String = {
+    let out = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let b = strByteAt(s, idx) & 255;
+        if (isUnreservedByte(b)) {
+            bufPushByte(out, b)
+        } else {
+            bufPushByte(out, 37);
+            bufPushByte(out, hexUpperByte((b >>> 4) & 15));
+            bufPushByte(out, hexUpperByte(b & 15))
+        };
+        cellSet(i, idx + 1)
+    };
+    bufToString(out)
+}
+
+pub def httpHeaderGet(headers: List HttpHeader, name: String): Option String =
+    findHeaderRec(headers, asciiLower(name))
+
+def findHeaderRec(headers: List HttpHeader, targetLower: String): Option String = match headers {
+    Nil -> None,
+    Cons(HttpHeader(k, v), rest) ->
+        if (asciiLower(k) == targetLower) Some(v)
+        else findHeaderRec(rest, targetLower),
+}
+
+def parseStatusLine(line: String): Result Int String = {
+    let trimmed = strTrim(line);
+    let n = strLen(trimmed);
+    let sp1 = cellNew(-1);
+    let sp2 = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        if (strByteAt(trimmed, idx) == 32) {
+            if (cellGet(sp1) < 0) cellSet(sp1, idx)
+            else if (cellGet(sp2) < 0) cellSet(sp2, idx)
+            else ()
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    let s1 = cellGet(sp1);
+    if (s1 < 0) Err("malformed HTTP status line: " + trimmed)
+    else {
+        let s2 = if (cellGet(sp2) > s1) cellGet(sp2) else n;
+        parseInt(strSlice(trimmed, s1 + 1, s2))
+    }
+}
+
+def parseHeadersList(lines: List String): List HttpHeader = match lines {
+    Nil -> Nil,
+    Cons(line, rest) -> {
+        let trimmed = strTrim(line);
+        let n = strLen(trimmed);
+        let colon = cellNew(-1);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(colon) < 0) {
+            let idx = cellGet(i);
+            if (strByteAt(trimmed, idx) == 58) cellSet(colon, idx) else ();
+            cellSet(i, idx + 1)
+        };
+        let cIdx = cellGet(colon);
+        let tail = parseHeadersList(rest);
+        if (cIdx > 0) {
+            let k = strTrim(strSlice(trimmed, 0, cIdx));
+            let v = strTrim(strSlice(trimmed, cIdx + 1, n));
+            Cons(HttpHeader(k, v), tail)
+        } else {
+            tail
+        }
+    },
+}
+
+def readHttpHeaderBlock(stream: TlsStream): Result String String = {
+    let out = bufNew();
+    let chunkCap = 4096;
+    let chunk = ptrAllocBytes(chunkCap);
+    let count = cellNew(0);
+    let state = cellNew(0);
+    let failed = cellNew(false);
+    let err = cellNew("");
+    while (cellGet(state) < 4 && cellGet(count) < 65536 && !cellGet(failed)) {
+        match tlsPeekPtr(stream, chunk, chunkCap) {
+            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+            Ok(n) ->
+                if (n == 0) {
+                    cellSet(err, "connection closed while reading HTTP headers");
+                    cellSet(failed, true)
+                } else {
+                    let take = cellNew(0);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n && cellGet(state) < 4) {
+                        let idx = cellGet(i);
+                        let b = ptrByteAt(chunk, idx);
+                        let st = cellGet(state);
+                        if (st == 0 && b == 13) cellSet(state, 1)
+                        else if (st == 1 && b == 10) cellSet(state, 2)
+                        else if (st == 2 && b == 13) cellSet(state, 3)
+                        else if (st == 3 && b == 10) cellSet(state, 4)
+                        else if (b == 13) cellSet(state, 1)
+                        else cellSet(state, 0);
+                        cellSet(take, idx + 1);
+                        cellSet(i, idx + 1)
+                    };
+                    let consume = cellGet(take);
+                    match tlsReadExactPtr(stream, chunk, consume) {
+                        Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
+                        Ok(_) -> {
+                            bufPushPtr(out, chunk, consume);
+                            cellSet(count, cellGet(count) + consume)
+                        },
+                    }
+                },
+        }
+    };
+    if (cellGet(failed)) Err(cellGet(err))
+    else if (cellGet(state) < 4) Err("HTTP response headers exceeded 64 KiB limit")
+    else Ok(bufToString(out))
+}
+
+def readExactToString(stream: TlsStream, len: Int): Result String String =
+    if (len <= 0) Ok("")
+    else {
+        let buf = ptrAllocBytes(len);
+        let _ = tlsReadExactPtr(stream, buf, len)?;
+        Ok(ptrSliceToString(buf, len))
+    }
+
+def readUntilEof(stream: TlsStream): Result String String = {
+    let out = bufNew();
+    let chunkCap = 16384;
+    let chunk = ptrAllocBytes(chunkCap);
+    let done = cellNew(false);
+    let failed = cellNew(false);
+    let err = cellNew("");
+    while (!cellGet(done) && !cellGet(failed)) {
+        match tlsReadPtr(stream, chunk, chunkCap) {
+            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+            Ok(n) ->
+                if (n == 0) cellSet(done, true)
+                else bufPushPtr(out, chunk, n),
+        }
+    };
+    if (cellGet(failed)) Err(cellGet(err))
+    else Ok(bufToString(out))
+}
+
+def parseHexInt(raw: String): Result Int String = {
+    let s = strTrim(raw);
+    let n = strLen(s);
+    if (n == 0) Err("empty hex chunk size")
+    else {
+        let acc = cellNew(0);
+        let i = cellNew(0);
+        let bad = cellNew(false);
+        while (cellGet(i) < n && !cellGet(bad)) {
+            let b = strByteAt(s, cellGet(i));
+            if (b == 59) {
+                // ';' chunk extension
+                cellSet(i, n)
+            } else if (b >= 48 && b <= 57) {
+                cellSet(acc, cellGet(acc) * 16 + (b - 48));
+                cellSet(i, cellGet(i) + 1)
+            } else if (b >= 97 && b <= 102) {
+                cellSet(acc, cellGet(acc) * 16 + (b - 87));
+                cellSet(i, cellGet(i) + 1)
+            } else if (b >= 65 && b <= 70) {
+                cellSet(acc, cellGet(acc) * 16 + (b - 55));
+                cellSet(i, cellGet(i) + 1)
+            } else {
+                cellSet(bad, true)
+            }
+        };
+        if (cellGet(bad)) Err("invalid hex chunk size: " + s)
+        else Ok(cellGet(acc))
+    }
+}
+
+pub def decodeChunkedBody(raw: String): Result String String = {
+    let out = bufNew();
+    let n = strLen(raw);
+    let pos = cellNew(0);
+    let done = cellNew(false);
+    let failed = cellNew(false);
+    let err = cellNew("");
+    while (!cellGet(done) && !cellGet(failed) && cellGet(pos) < n) {
+        let start = cellGet(pos);
+        let nl = cellNew(-1);
+        let i = cellNew(start);
+        while (cellGet(i) < n && cellGet(nl) < 0) {
+            if (strByteAt(raw, cellGet(i)) == 10) cellSet(nl, cellGet(i)) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        let lineEnd = cellGet(nl);
+        if (lineEnd < 0) {
+            cellSet(err, "unterminated chunk size line");
+            cellSet(failed, true)
+        } else {
+            let sizeLine = strSlice(raw, start, lineEnd);
+            match parseHexInt(sizeLine) {
+                Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+                Ok(chunkLen) ->
+                    if (chunkLen == 0) {
+                        cellSet(done, true)
+                    } else {
+                        let dataStart = lineEnd + 1;
+                        let dataEnd = dataStart + chunkLen;
+                        if (dataEnd > n) {
+                            cellSet(err, "truncated chunked body");
+                            cellSet(failed, true)
+                        } else {
+                            bufPushStr(out, strSlice(raw, dataStart, dataEnd));
+                            // Skip trailing CRLF after chunk data
+                            let nextPos =
+                                if (dataEnd + 1 < n && strByteAt(raw, dataEnd) == 13 && strByteAt(raw, dataEnd + 1) == 10) dataEnd + 2
+                                else if (dataEnd < n && strByteAt(raw, dataEnd) == 10) dataEnd + 1
+                                else dataEnd;
+                            cellSet(pos, nextPos)
+                        }
+                    },
+            }
+        }
+    };
+    if (cellGet(failed)) Err(cellGet(err))
+    else Ok(bufToString(out))
+}
+
+def hasHeaderName(headers: List HttpHeader, targetLower: String): Bool = match httpHeaderGet(headers, targetLower) {
+    Some(_) -> true,
+    None -> false,
+}
+
+def pushHeaders(buf: std.buf.StringBuf, headers: List HttpHeader): Void = match headers {
+    Nil -> (),
+    Cons(HttpHeader(k, v), rest) -> {
+        bufPushStr(buf, k);
+        bufPushStr(buf, ": ");
+        bufPushStr(buf, v);
+        bufPushStr(buf, "\r\n");
+        pushHeaders(buf, rest)
+    },
+}
+
+def containsSubstr(haystack: String, needle: String): Bool = {
+    let hn = strLen(haystack);
+    let nn = strLen(needle);
+    if (nn == 0) true
+    else if (nn > hn) false
+    else {
+        let found = cellNew(false);
+        let i = cellNew(0);
+        while (cellGet(i) <= hn - nn && !cellGet(found)) {
+            if (strSlice(haystack, cellGet(i), cellGet(i) + nn) == needle) cellSet(found, true)
+            else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(found)
+    }
+}
+
+pub def httpRequest(
+    method: String,
+    host: String,
+    port: Int,
+    path: String,
+    headers: List HttpHeader,
+    body: String,
+    timeoutMs: Int
+): Result HttpResponse String = {
+    let stream = tlsConnectWithTimeout(host, port, timeoutMs)?;
+    let reqPath = if (strLen(path) == 0) "/" else path;
+    let req = bufNew();
+    bufPushStr(req, method);
+    bufPushStr(req, " ");
+    bufPushStr(req, reqPath);
+    bufPushStr(req, " HTTP/1.1\r\n");
+    if (!hasHeaderName(headers, "host")) {
+        bufPushStr(req, "Host: ");
+        bufPushStr(req, host);
+        if (port != 443) {
+            bufPushStr(req, ":");
+            bufPushStr(req, intToStr(port))
+        } else ();
+        bufPushStr(req, "\r\n")
+    } else ();
+    if (!hasHeaderName(headers, "user-agent")) {
+        bufPushStr(req, "User-Agent: geisha-tls/0.1\r\n")
+    } else ();
+    if (!hasHeaderName(headers, "connection")) {
+        bufPushStr(req, "Connection: close\r\n")
+    } else ();
+    let bodyLen = strLen(body);
+    if (bodyLen > 0 && !hasHeaderName(headers, "content-length")) {
+        bufPushStr(req, "Content-Length: ");
+        bufPushStr(req, intToStr(bodyLen));
+        bufPushStr(req, "\r\n")
+    } else ();
+    pushHeaders(req, headers);
+    bufPushStr(req, "\r\n");
+    if (bodyLen > 0) bufPushStr(req, body) else ();
+
+    match tlsWrite(stream, bufToString(req)) {
+        Err(e) -> { tlsClose(stream); Err(e) },
+        Ok(_) ->
+            match readHttpHeaderBlock(stream) {
+                Err(e) -> { tlsClose(stream); Err(e) },
+                Ok(rawHdr) -> {
+                    let lines = strSplitChar(rawHdr, '\n');
+                    match lines {
+                        Nil -> { tlsClose(stream); Err("empty HTTP response") },
+                        Cons(statusLine, hdrLines) ->
+                            match parseStatusLine(statusLine) {
+                                Err(e) -> { tlsClose(stream); Err(e) },
+                                Ok(code) -> {
+                                    let respHeaders = parseHeadersList(hdrLines);
+                                    let isChunked = match httpHeaderGet(respHeaders, "transfer-encoding") {
+                                        Some(te) -> containsSubstr(asciiLower(te), "chunked"),
+                                        None -> false,
+                                    };
+                                    let bodyRes =
+                                        if (isChunked) {
+                                            match readUntilEof(stream) {
+                                                Err(e) -> Err(e),
+                                                Ok(rawBody) -> decodeChunkedBody(rawBody),
+                                            }
+                                        } else {
+                                            match httpHeaderGet(respHeaders, "content-length") {
+                                                Some(clStr) ->
+                                                    match parseInt(strTrim(clStr)) {
+                                                        Ok(cl) -> readExactToString(stream, cl),
+                                                        Err(_) -> readUntilEof(stream),
+                                                    },
+                                                None -> readUntilEof(stream),
+                                            }
+                                        };
+                                    tlsClose(stream);
+                                    match bodyRes {
+                                        Err(e) -> Err(e),
+                                        Ok(respBody) -> Ok(MkHttpResponse {
+                                            status: code,
+                                            headers: respHeaders,
+                                            body: respBody,
+                                        }),
+                                    }
+                                },
+                            },
+                    }
+                },
+            },
+    }
+}
+
+pub def httpGet(host: String, path: String): Result HttpResponse String =
+    httpRequest("GET", host, 443, path, Nil, "", 15000)
+
+pub def httpGetHeaders(host: String, path: String, headers: List HttpHeader): Result HttpResponse String =
+    httpRequest("GET", host, 443, path, headers, "", 15000)
+
+pub def httpPost(host: String, path: String, headers: List HttpHeader, body: String): Result HttpResponse String =
+    httpRequest("POST", host, 443, path, headers, body, 15000)

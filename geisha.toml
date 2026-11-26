@@ -1,0 +1,9 @@
+name = "tls"
+version = "0.1.0"
+src_dir = "src"
+tests = ["tests/spec.gsa"]
+
+[target.native]
+c_sources = ["native/gs_tls.c"]
+c_flags = ["-I/opt/homebrew/opt/openssl@3/include"]
+link_flags = ["-L/opt/homebrew/opt/openssl@3/lib", "-Wl,-rpath,/opt/homebrew/opt/openssl@3/lib", "-lssl", "-lcrypto"]

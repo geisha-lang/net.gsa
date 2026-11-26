@@ -1,0 +1,129 @@
+// Native TLS 1.2/1.3 client streams (`tls`) backed by OpenSSL 3.
+// `TlsStream` wraps an opaque `Int64` slot handle so it is `Send` and safe to
+// pass across `std.task.spawn`, `std.sync.Chan`, and `std.actor.Actor`.
+
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushStr, bufToString}
+
+extern "gs_tls_connect_ex" def c_tls_connect_ex(host: String, port: Int, verify: Int, timeoutMs: Int): Int64
+extern "gs_tls_read" def c_tls_read(handle: Int64, buf: Ptr, cap: Int): Int
+extern "gs_tls_peek" def c_tls_peek(handle: Int64, buf: Ptr, cap: Int): Int
+extern "gs_tls_write" def c_tls_write(handle: Int64, buf: Ptr, len: Int): Int
+extern "gs_tls_write_str" def c_tls_write_str(handle: Int64, buf: String, len: Int): Int
+extern "gs_tls_close" def c_tls_close(handle: Int64): Int
+extern "gs_tls_last_error" def c_tls_last_error(): String
+
+pub data TlsStream {
+    TlsStream(Int64),
+}
+
+def lastTlsErr(fallback: String): String = {
+    let e = c_tls_last_error();
+    if (strLen(e) > 0) {
+        let b = bufNew();
+        bufPushStr(b, e);
+        bufToString(b)
+    } else fallback
+}
+
+// Connect with SNI + system root CA & hostname verification (default 15s timeout).
+pub def tlsConnect(host: String, port: Int): Result TlsStream String =
+    tlsConnectWithTimeout(host, port, 15000)
+
+pub def tlsConnectWithTimeout(host: String, port: Int, timeoutMs: Int): Result TlsStream String = {
+    let h = c_tls_connect_ex(host, port, 1, timeoutMs);
+    if (h < intToI64(0)) Err(lastTlsErr("TLS connect failed to " + host))
+    else Ok(TlsStream(h))
+}
+
+// Connect without certificate verification (for local/self-signed testing only).
+pub def tlsConnectInsecure(host: String, port: Int, timeoutMs: Int): Result TlsStream String = {
+    let h = c_tls_connect_ex(host, port, 0, timeoutMs);
+    if (h < intToI64(0)) Err(lastTlsErr("TLS connect failed to " + host))
+    else Ok(TlsStream(h))
+}
+
+pub def tlsClose(stream: TlsStream): Void = match stream {
+    TlsStream(h) -> {
+        let _ = c_tls_close(h);
+        ()
+    },
+}
+
+pub def tlsReadPtr(stream: TlsStream, buf: Ptr, cap: Int): Result Int String = match stream {
+    TlsStream(h) -> {
+        let n = c_tls_read(h, buf, cap);
+        if (n < 0) Err(lastTlsErr("TLS read failed"))
+        else Ok(n)
+    },
+}
+
+pub def tlsPeekPtr(stream: TlsStream, buf: Ptr, cap: Int): Result Int String = match stream {
+    TlsStream(h) -> {
+        let n = c_tls_peek(h, buf, cap);
+        if (n < 0) Err(lastTlsErr("TLS peek failed"))
+        else Ok(n)
+    },
+}
+
+pub def tlsReadExactPtr(stream: TlsStream, buf: Ptr, count: Int): Result Void String =
+    if (count <= 0) Ok(())
+    else {
+        let first = tlsReadPtr(stream, buf, count)?;
+        if (first == 0) {
+            Err("unexpected EOF on TLS stream")
+        } else if (first >= count) {
+            Ok(())
+        } else {
+            let got = cellNew(first);
+            let tmp = ptrAllocBytes(count - first);
+            let failed = cellNew(false);
+            let err = cellNew("");
+            while (cellGet(got) < count && !cellGet(failed)) {
+                let base = cellGet(got);
+                let rem = count - base;
+                match tlsReadPtr(stream, tmp, rem) {
+                    Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+                    Ok(n) ->
+                        if (n == 0) {
+                            cellSet(err, "unexpected EOF on TLS stream");
+                            cellSet(failed, true)
+                        } else {
+                            ptrCopyBytes(buf, base, tmp, 0, n);
+                            cellSet(got, base + n)
+                        },
+                }
+            };
+            if (cellGet(failed)) Err(cellGet(err))
+            else Ok(())
+        }
+    }
+
+pub def tlsRead(stream: TlsStream, maxBytes: Int): Result String String = {
+    let cap = if (maxBytes <= 0) 1 else maxBytes;
+    let buf = ptrAllocBytes(cap);
+    let n = tlsReadPtr(stream, buf, cap)?;
+    Ok(ptrSliceToString(buf, n))
+}
+
+pub def tlsWritePtr(stream: TlsStream, buf: Ptr, len: Int): Result Void String = match stream {
+    TlsStream(h) ->
+        if (len <= 0) Ok(())
+        else {
+            let n = c_tls_write(h, buf, len);
+            if (n < len) Err(lastTlsErr("TLS write failed"))
+            else Ok(())
+        },
+}
+
+pub def tlsWrite(stream: TlsStream, payload: String): Result Void String = match stream {
+    TlsStream(h) -> {
+        let total = strLen(payload);
+        if (total <= 0) Ok(())
+        else {
+            let n = c_tls_write_str(h, payload, total);
+            if (n < total) Err(lastTlsErr("TLS write failed"))
+            else Ok(())
+        }
+    },
+}
