@@ -5,5 +5,12 @@ tests = ["tests/spec.gsa"]
 
 [target.native]
 c_sources = ["native/gs_tls.c"]
-c_flags = ["-I/opt/homebrew/opt/openssl@3/include"]
-link_flags = ["-L/opt/homebrew/opt/openssl@3/lib", "-Wl,-rpath,/opt/homebrew/opt/openssl@3/lib", "-lssl", "-lcrypto"]
+
+[[target.native.when]]
+os = "macos"
+c_flags = ["-I/opt/homebrew/opt/openssl@3/include", "-I/usr/local/opt/openssl@3/include"]
+link_flags = ["-L/opt/homebrew/opt/openssl@3/lib", "-Wl,-rpath,/opt/homebrew/opt/openssl@3/lib", "-L/usr/local/opt/openssl@3/lib", "-lssl", "-lcrypto"]
+
+[[target.native.when]]
+os = "linux"
+pkg_config = "openssl"
